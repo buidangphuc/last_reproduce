@@ -30,7 +30,7 @@ vae = LSTM_VAE(input_dim=2, latent_dim=2, hidden_dim=64)
 optimizer = torch.optim.Adam(vae.parameters(), lr=0.001)
 
 # Train the VAE
-train_vae(train_data, vae, optimizer, epochs=10)
+train_vae(train_data, vae, optimizer, epochs=100)
 
 # Train KNN
 knn = KNeighborsClassifier(n_neighbors=5)
@@ -42,7 +42,7 @@ random_idx = np.random.randint(0, len(test_data))
 sample = test_data[random_idx]
 
 # Generate explanation and highlight points
-explanation, highlighted_points = explain_sample(sample, vae, knn, num_neighbors=10)
+explanation, highlighted_points = explain_sample(sample, vae, knn, num_neighbors=5)
 
 # Display explanation
 print(f"Explanation for sample {random_idx}:")
