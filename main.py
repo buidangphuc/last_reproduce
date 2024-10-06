@@ -1,12 +1,15 @@
 import torch
-from vae import LSTM_VAE, train_vae
-from explanation import explain_sample
-from sklearn.neighbors import KNeighborsClassifier
 import numpy as np
+from vae import LSTM_VAE, vae_loss
+from neighen import LatentNeighborhoodGenerator 
+from counter_generator import CounterGenerator
+from latent_tree import LatentDecisionTreeExtractor
+from shapelet import ShapeletExtractor
+from plot import ShapeletPlotter
+import random
 import pandas as pd
-import matplotlib.pyplot as plt
+from model import KNN
 
-# Load data (latitude, longitude)
 def read_and_prepare_data(file_path):
     df = pd.read_csv(file_path)
     
@@ -18,63 +21,82 @@ def read_and_prepare_data(file_path):
     
     return time_series_tensors, df['Label'].values
 
-# Load train and test data
-train_file_path = '1_patel_hurricane_2vs3_train.csv'
-test_file_path = '1_patel_hurricane_2vs3_test.csv'
+def run_all_flow(train_file, test_file):
+    # Step 1: Read and prepare train and test data
+    train_data_tensors, train_labels = read_and_prepare_data(train_file)
+    test_data_tensors, test_labels = read_and_prepare_data(test_file)
+    print(test_data_tensors)
+    
+    # Initialize the VAE model
+    vae = LSTM_VAE(input_dim=2, latent_dim=128, hidden_dim=64)  # Latitude and longitude only
+    optimizer = torch.optim.Adam(vae.parameters(), lr=0.001)
+    
+    # Train the VAE
+    for epoch in range(2):  # You can adjust the number of epochs
+        total_loss = 0
+        for trajectory in train_data_tensors:
+            optimizer.zero_grad()
+            seq_len = trajectory.size(1)
+            recon, mean, logvar = vae(trajectory, [seq_len])  # Pass sequence length
+            loss = vae_loss(recon, trajectory, mean, logvar)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch [{epoch+1}/10], Loss: {total_loss/len(train_data_tensors)}")
+    
+    # Flatten the data for KNN (ensure that we use the raw time-series data, not the latent representations)
+    X_train = [ts.squeeze(0).numpy() for ts in train_data_tensors]  # Use the time-series data for KNN with DTW
+    X_test = [ts.squeeze(0).numpy() for ts in test_data_tensors]
 
-train_data, train_labels = read_and_prepare_data(train_file_path)
-test_data, test_labels = read_and_prepare_data(test_file_path)
+    # Step 2: Use your custom KNN as the black-box model
+    knn_model = KNN(k=5)  # Example k=5, you can tune this
+    knn_model.fit(X_train, train_labels)
 
-# Initialize the VAE
-vae = LSTM_VAE(input_dim=2, latent_dim=2, hidden_dim=64)
-optimizer = torch.optim.Adam(vae.parameters(), lr=0.001)
+    # Select a random test sample for explanation
+    random_test_sample = random.choice(test_data_tensors)
+    test_sample_tensor = random_test_sample  # Already a tensor
 
-# Train the VAE
-train_vae(train_data, vae, optimizer, epochs=100)
+    # Step 3: Encode the test sample using the VAE encoder
+    latent_test_sample, _ = vae.encoder(test_sample_tensor)
+    
+    # Step 4: Generate and classify neighborhood using LatentNeighborhoodGenerator
+    latent_neighgen = LatentNeighborhoodGenerator(vae, knn_model)  # Initialize LatentNeighborhoodGenerator
+    predictions = latent_neighgen.run(latent_test_sample.squeeze(0), [test_sample_tensor.size(1)])
+    print(f"Neighborhood Predictions: {predictions}")
+    
+    # Step 5: Generate counter-exemplars using the CounterGenerator
+    counter_generator = CounterGenerator(blackbox=vae)
+    explanation = counter_generator.explain(latent_test_sample.squeeze(0).numpy(), z_label=1, n=500)  # z_label=1 (example)
+    
+    exemplars = torch.tensor(explanation['exemplars'], dtype=torch.float32)
+    counter_exemplars = torch.tensor(explanation['counter_exemplars'], dtype=torch.float32)
+    
+    # Step 6: Train the latent decision tree using LatentDecisionTreeExtractor
+    latent_tree_extractor = LatentDecisionTreeExtractor(vae)  # Initialize latent tree extractor
+    tree_model = latent_tree_extractor.train_latent_tree(latent_test_sample.squeeze(0).cpu().numpy(), predictions)  # Train decision tree
 
-# Train KNN
-knn = KNeighborsClassifier(n_neighbors=5)
-latent_train = [vae.encoder(ts)[0].detach().numpy() for ts in train_data]
-knn.fit(np.vstack(latent_train), train_labels)
+    # Step 7: Extract factual and counterfactual rules from the decision tree
+    factual_rule = latent_tree_extractor.extract_factual_rule(sample_idx=0)
+    counterfactual_rule = latent_tree_extractor.extract_counterfactual_rule(sample_idx=0)
+    
+    print("Factual Rule:", factual_rule)
+    print("Counterfactual Rule:", counterfactual_rule)
+    
+    # Step 8: Learn shapelets and extract rules
+    shapelet_extractor = ShapeletExtractor(exemplars, counter_exemplars)
+    shapelet_rules = shapelet_extractor.run(latent_test_sample.squeeze(0), predictions, num_shapelets=5)
+    print("Extracted Shapelet Rules:")
+    for rule in shapelet_rules:
+        print(rule)
+    
+    # Step 9: Plot the shapelets on the original trajectory
+    shapelet_plotter = ShapeletPlotter()
+    shapelets = shapelet_extractor.learn_shapelets(num_shapelets=2)
+    shapelet_plotter.plot_multiple_shapelets_on_trajectory(np.array(random_test_sample.squeeze(0)), shapelets, [(3, 6), (10, 13)])
 
-# Randomly select one test sample for explanation
-random_idx = np.random.randint(0, len(test_data))
-sample = test_data[random_idx]
-
-# Generate explanation and highlight points
-explanation, highlighted_points = explain_sample(sample, vae, knn, num_neighbors=5)
-
-# Display explanation
-print(f"Explanation for sample {random_idx}:")
-print(explanation.explain())
-
-# Display the highlighted points on the trajectory
-print(f"Highlighted important points on the trajectory: {highlighted_points}")
-
-def visualize_hurricane_trajectory(sample, highlighted_points=None):
-    # Convert the tensor to a numpy array
-    sample_np = sample.squeeze().detach().numpy()
-    latitudes = sample_np[:, 0]
-    longitudes = sample_np[:, 1]
-
-    # Plot the full trajectory in blue
-    plt.figure(figsize=(10, 6))
-    plt.plot(longitudes, latitudes, label="Trajectory", marker="o", color="blue", linestyle="-")
-
-    # Highlight the important points (if provided) in red
-    if highlighted_points is not None and len(highlighted_points) > 0:
-        important_latitudes = latitudes[highlighted_points]
-        important_longitudes = longitudes[highlighted_points]
-        plt.scatter(important_longitudes, important_latitudes, color="red", s=100, zorder=5, label="Important Points")
-
-    # Adding labels and title
-    plt.xlabel("Longitude")
-    plt.ylabel("Latitude")
-    plt.title("Hurricane Trajectory with Highlighted Points")
-    plt.legend()
-    plt.grid(True)
-    plt.show()
-
-# Example usage:
-# visualize_hurricane_trajectory(sample, highlighted_points)
-visualize_hurricane_trajectory(sample, highlighted_points)
+if __name__ == "__main__":
+    # Paths to your train and test CSV files
+    train_file = "1_patel_hurricane_2vs3_train.csv"
+    test_file = "1_patel_hurricane_2vs3_test.csv"
+    
+    run_all_flow(train_file, test_file)
